@@ -1,4 +1,3 @@
 # Test concurrent assertions (assert/assume/cover property)
-# Expected to FAIL - concurrent assertions with properties not supported in yosys-slang
 
 read_slang 14_concurrent_assertions.sv --top concurrent_assertions_test

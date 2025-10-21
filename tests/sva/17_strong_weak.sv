@@ -1,6 +1,5 @@
 // Test: Strong and Weak Sequence Operators
 // Category: Advanced sequence semantics
-// Expected: Should pass after implementation
 
 module strong_weak_test(
     input logic clk,

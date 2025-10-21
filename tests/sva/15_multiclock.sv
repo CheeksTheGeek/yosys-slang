@@ -1,6 +1,5 @@
 // Test: Multi-Clock Assertions
 // Category: Assertions spanning multiple clock domains
-// Expected: Should fail - multi-clock assertions not supported
 
 module multiclock_test(
     input logic clk1,

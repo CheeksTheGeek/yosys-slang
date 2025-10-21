@@ -1,6 +1,5 @@
 // Test: Conditional Properties (if/else)
 // Category: Runtime property selection
-// Expected: Should pass after implementation
 
 module conditional_property_test(
     input logic clk,

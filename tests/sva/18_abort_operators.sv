@@ -1,6 +1,5 @@
 // Test: Abort Operators (accept_on, reject_on)
 // Category: Early property termination
-// Expected: Should pass after implementation
 
 module abort_operators_test(
     input logic clk,

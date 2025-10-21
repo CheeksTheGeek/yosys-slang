@@ -1,6 +1,5 @@
 // Test: Implication Operators (|-> and |=>)
 // Category: Sequence to property operators
-// Expected: Should fail - implication operators not supported
 
 module implication_test(
     input logic clk,

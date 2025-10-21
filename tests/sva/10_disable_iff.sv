@@ -1,6 +1,5 @@
 // Test: Disable iff Clause
 // Category: Conditional assertion disabling
-// Expected: Should fail - disable iff not supported
 
 module disable_iff_test(
     input logic clk,

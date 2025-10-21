@@ -1,4 +1,3 @@
 # Test complex real-world SVA scenarios
-# Expected to FAIL - demonstrates realistic formal verification scenarios
 
 read_slang 16_complex_scenarios.sv --top complex_sva_scenarios

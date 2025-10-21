@@ -1,6 +1,5 @@
 // Test: Concurrent Assertions (assert/assume/cover property)
 // Category: Full concurrent assertion syntax
-// Expected: Should fail - concurrent assertions with properties not supported
 
 module concurrent_assertions_test(
     input logic clk,

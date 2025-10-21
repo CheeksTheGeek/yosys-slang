@@ -1,6 +1,5 @@
 // Test: Non-Consecutive Repetition [=n] and Goto Repetition [->n]
 // Category: Advanced sequence repetition
-// Expected: Should fail - non-consecutive and goto repetition not supported
 
 module nonconsec_goto_repetition_test(
     input logic clk,

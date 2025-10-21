@@ -1,6 +1,5 @@
 // Test: Temporal Delay Operators (##)
 // Category: Sequence operators - cycle delays
-// Expected: Should fail - temporal delay operators not supported
 
 module temporal_delay_test(
     input logic clk,

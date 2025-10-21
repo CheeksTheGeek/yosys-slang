@@ -1,6 +1,5 @@
 // Test: Intersect and First_match Operators
 // Category: Advanced sequence operators
-// Expected: Should fail - intersect and first_match not supported
 
 module intersect_firstmatch_test(
     input logic clk,

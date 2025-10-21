@@ -1,6 +1,5 @@
 // Test: Case Property Selection
 // Category: Multi-way property selection
-// Expected: Should pass after implementation
 
 module case_property_test(
     input logic clk,

@@ -1,6 +1,5 @@
 // Test: Complex Real-World SVA Scenarios
 // Category: Comprehensive examples combining multiple features
-// Expected: Should fail - demonstrates realistic formal verification scenarios
 
 module complex_sva_scenarios(
     input logic clk,

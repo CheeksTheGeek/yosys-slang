@@ -70,7 +70,6 @@ set(ALL_TESTS
     sva/14_concurrent_assertions.ys
     sva/15_multiclock.ys
     sva/16_complex_scenarios.ys
-    # Advanced SVA Features
     sva/17_strong_weak.ys
     sva/18_abort_operators.ys
     sva/19_conditional_property.ys

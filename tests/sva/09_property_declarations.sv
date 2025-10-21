@@ -1,6 +1,5 @@
 // Test: Property Declarations
 // Category: Named properties and reusability
-// Expected: Should fail - property declarations not supported
 
 module property_declarations_test(
     input logic clk,

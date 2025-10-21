@@ -1,4 +1,3 @@
 # Test property declarations
-# Expected to FAIL - property declarations not supported in yosys-slang
 
 read_slang 09_property_declarations.sv --top property_declarations_test

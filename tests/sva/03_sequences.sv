@@ -1,6 +1,5 @@
 // Test: Sequence Declarations
 // Category: Named sequences and reusability
-// Expected: Should fail - sequence declarations not supported
 
 module sequence_test(
     input logic clk,

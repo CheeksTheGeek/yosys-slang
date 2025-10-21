@@ -1,4 +1,3 @@
 # Test non-consecutive [=n] and goto [->n] repetition
-# Expected to FAIL - non-consecutive and goto repetition not supported in yosys-slang
 
 read_slang 05_repetition_nonconsec.sv --top nonconsec_goto_repetition_test

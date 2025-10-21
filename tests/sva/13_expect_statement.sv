@@ -1,6 +1,5 @@
 // Test: Expect Statement
 // Category: Procedural assertion with blocking behavior
-// Expected: Should fail - expect statement not supported
 
 module expect_statement_test(
     input logic clk,

@@ -1,6 +1,5 @@
 // Test: Deferred Assertions (#0 and final)
 // Category: Immediate assertion timing control
-// Expected: Should fail - deferred assertions not supported
 
 module deferred_assertions_test(
     input logic clk,

@@ -1,4 +1,3 @@
 # Test multi-clock assertions
-# Expected to FAIL - multi-clock assertions not supported in yosys-slang
 
 read_slang 15_multiclock.sv --top multiclock_test

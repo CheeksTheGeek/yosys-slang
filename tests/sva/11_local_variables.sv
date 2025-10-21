@@ -1,6 +1,5 @@
 // Test: Local Variables in Properties and Sequences
 // Category: Advanced property features
-// Expected: Should fail - local variables in properties not supported
 
 module local_variables_test(
     input logic clk,

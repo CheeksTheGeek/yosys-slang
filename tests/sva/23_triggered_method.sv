@@ -1,6 +1,5 @@
 // Test: Sequence .triggered Method (used within sequences)
 // Category: Sequence evaluation tracking
-// Expected: Should pass after implementation
 
 module triggered_method_test(
     input logic clk,

@@ -1,6 +1,5 @@
 // Test: Zero-Length Sequences
 // Category: Edge cases in sequence matching
-// Expected: Should pass after implementation
 
 module zero_length_test(
     input logic clk,

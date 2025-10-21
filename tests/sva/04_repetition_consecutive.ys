@@ -1,4 +1,3 @@
 # Test consecutive repetition operators [*n]
-# Expected to FAIL - consecutive repetition not supported in yosys-slang
 
 read_slang 04_repetition_consecutive.sv --top consecutive_repetition_test

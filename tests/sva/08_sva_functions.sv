@@ -1,6 +1,5 @@
 // Test: SVA System Functions
 // Category: Temporal system functions
-// Expected: Should fail - SVA system functions not supported
 
 module sva_functions_test(
     input logic clk,

@@ -1,6 +1,5 @@
 // Test: Throughout and Within Operators
 // Category: Sequence operators for condition checking
-// Expected: Should fail - throughout and within operators not supported
 
 module throughout_within_test(
     input logic clk,

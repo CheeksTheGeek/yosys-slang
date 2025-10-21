@@ -1,4 +1,3 @@
 # Test SVA system functions ($rose, $fell, $stable, $past, etc.)
-# Expected to FAIL - SVA system functions not supported in yosys-slang
 
 read_slang 08_sva_functions.sv --top sva_functions_test

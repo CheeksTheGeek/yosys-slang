@@ -1,4 +1,3 @@
 # Test throughout and within operators
-# Expected to FAIL - throughout and within operators not supported in yosys-slang
 
 read_slang 06_throughout_within.sv --top throughout_within_test

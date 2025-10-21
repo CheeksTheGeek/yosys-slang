@@ -1,6 +1,5 @@
 // Test: Sequence Methods (.triggered, .matched)
 // Category: Sequence status queries within sequences
-// Expected: Should pass after implementation
 
 module sequence_methods_test(
     input logic clk,

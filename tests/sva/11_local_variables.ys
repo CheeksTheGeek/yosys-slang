@@ -1,4 +1,3 @@
 # Test local variables in properties
-# Expected to FAIL - local variables in properties not supported in yosys-slang
 
 read_slang 11_local_variables.sv --top local_variables_test

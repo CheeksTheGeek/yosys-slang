@@ -1,6 +1,5 @@
 // Test: Consecutive Repetition [*n]
 // Category: Sequence repetition operators
-// Expected: Should fail - consecutive repetition not supported
 
 module consecutive_repetition_test(
     input logic clk,
