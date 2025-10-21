@@ -1710,7 +1710,11 @@ void SVAConverter::optimize_cond(std::vector<RTLIL::Const> &values)
             
             if (delta_pos >= 0 && i_within_j && j_within_i) {
                 did_something = true;
-                values[i].set(delta_pos, RTLIL::State::Sa);
+                std::vector<RTLIL::State> new_bits;
+                for (int k = 0; k < GetSize(values[i]); k++) {
+                    new_bits.push_back(k == delta_pos ? RTLIL::State::Sa : values[i][k]);
+                }
+                values[i] = RTLIL::Const(new_bits);
                 values[j] = values.back();
                 values.pop_back();
                 goto next_pair;
