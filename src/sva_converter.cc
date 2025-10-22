@@ -13,9 +13,13 @@
 #include "slang/ast/symbols/ValueSymbol.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/expressions/CallExpression.h"
+#include "slang/ast/expressions/SelectExpressions.h"
+#include "slang/ast/expressions/ConversionExpression.h"
+#include <functional>
 
 using Yosys::GetSize;
 
@@ -229,10 +233,78 @@ RTLIL::SigSpec SVAConverter::eval_expr(const ast::Expression &expr) {
                     return eval(expr);
             }
         }
+
+        // For other expression types that contain SVA functions, we need to handle them
+        // by recursively evaluating sub-expressions. This covers cases like:
+        // - Conditional expressions (ternary operators)
+        // - Concatenation expressions
+        // - Other complex expressions that contain $past, $rose, etc.
+        
+        // Handle conditional expressions (ternary operator)
+        if (expr.kind == EK::ConditionalOp) {
+            auto &cond = expr.as<ast::ConditionalExpression>();
+            // For conditional expressions, we need to evaluate the first condition
+            // (most conditional expressions have only one condition)
+            RTLIL::SigSpec cond_spec = eval_expr(*cond.conditions[0].expr);
+            RTLIL::SigBit cond_bit = netlist.ReduceBool(cond_spec);
+            RTLIL::SigSpec true_val = eval_expr(cond.left());
+            RTLIL::SigSpec false_val = eval_expr(cond.right());
+            return netlist.Mux(false_val, true_val, cond_bit);
+        }
+
+        // Handle concatenation expressions
+        if (expr.kind == EK::Concatenation) {
+            auto &concat = expr.as<ast::ConcatenationExpression>();
+            RTLIL::SigSpec result;
+            for (auto *operand : concat.operands()) {
+                result.append(eval_expr(*operand));
+            }
+            return result;
+        }
+
+        // Handle member access expressions (e.g., struct.field)
+        if (expr.kind == EK::MemberAccess) {
+            auto &member = expr.as<ast::MemberAccessExpression>();
+            RTLIL::SigSpec value = eval_expr(member.value());
+            // For now, delegate to general evaluator for member access
+            // This could be enhanced to handle SVA functions in member expressions
+            return eval(expr);
+        }
+
+        // Handle array access expressions (e.g., array[index])
+        if (expr.kind == EK::ElementSelect) {
+            auto &select = expr.as<ast::ElementSelectExpression>();
+            RTLIL::SigSpec value = eval_expr(select.value());
+            RTLIL::SigSpec index = eval_expr(select.selector());
+            // For now, delegate to general evaluator for array access
+            // This could be enhanced to handle SVA functions in array expressions
+            return eval(expr);
+        }
+
+        // For any other expression types that contain SVA functions but aren't handled above,
+        // we need to be more careful. The issue is that we can't just delegate to the general
+        // evaluator because it will encounter the SVA functions and error out.
+        // Instead, we should try to handle common cases or provide a more graceful fallback.
+        
+        log_warning("SVA converter: expression type %d contains SVA functions but is not fully handled\n",
+                   (int)expr.kind);
+        
+        // As a last resort, try to delegate to general evaluator but with SVA context disabled
+        // This is risky but may work for some cases
+        bool saved_sva_context = eval.in_sva_context;
+        eval.in_sva_context = false;
+        RTLIL::SigSpec result = eval(expr);
+        eval.in_sva_context = saved_sva_context;
+        return result;
     }
 
     // Delegate to the general expression evaluator for non-SVA expressions
-    return eval(expr);
+    // Temporarily disable SVA context to allow general evaluator to handle the expression
+    bool saved_sva_context = eval.in_sva_context;
+    eval.in_sva_context = false;
+    RTLIL::SigSpec result = eval(expr);
+    eval.in_sva_context = saved_sva_context;
+    return result;
 }
 
 RTLIL::SigBit SVAConverter::make_cond_eq(const RTLIL::SigSpec &ctrl, RTLIL::SigBit enable) {
@@ -399,9 +471,20 @@ void SVAConverter::extract_clocking(const ast::AssertionExpr &expr) {
     bool explicit_clocking = false;
     bool explicit_disable_iff = false;
 
+    // Unwrap SimpleAssertionExpr containing AssertionInstanceExpression (named property reference)
+    // When a property is declared separately, the clock is in the property body, not the reference
+    const ast::AssertionExpr *current_expr = &expr;
+    if (expr.kind == ast::AssertionExprKind::Simple) {
+        auto &simple_expr = expr.as<ast::SimpleAssertionExpr>();
+        if (simple_expr.expr.kind == ast::ExpressionKind::AssertionInstance) {
+            auto &aie = simple_expr.expr.as<ast::AssertionInstanceExpression>();
+            current_expr = &aie.body;
+        }
+    }
+
     // Look for explicit clocking expression
-    if (expr.kind == ast::AssertionExprKind::Clocking) {
-        auto &clocking_expr = expr.as<ast::ClockingAssertionExpr>();
+    if (current_expr->kind == ast::AssertionExprKind::Clocking) {
+        auto &clocking_expr = current_expr->as<ast::ClockingAssertionExpr>();
         explicit_clocking = true;
 
         // Extract clock from timing control
@@ -417,16 +500,50 @@ void SVAConverter::extract_clocking(const ast::AssertionExpr &expr) {
             has_reset = true;
             explicit_disable_iff = true;
         }
-    } else if (expr.kind == ast::AssertionExprKind::DisableIff) {
-        auto &disable_expr = expr.as<ast::DisableIffAssertionExpr>();
+    } else if (current_expr->kind == ast::AssertionExprKind::DisableIff) {
+        auto &disable_expr = current_expr->as<ast::DisableIffAssertionExpr>();
         rst = eval_expr(disable_expr.condition);
         has_reset = true;
         explicit_disable_iff = true;
     }
 
-    // If no explicit clocking, check for default clocking block or use module's clock
+    // If no explicit clocking, try default clocking block from slang
     if (!explicit_clocking) {
-        if (auto defaultClocking = netlist.compilation.getDefaultClocking(static_cast<const ast::Scope&>(netlist.realm))) {
+        // For bind modules, netlist.realm is the bind *target*, not the module with assertions
+        // We need to find the actual module containing the assertions by looking at all instances
+        auto defaultClocking = netlist.compilation.getDefaultClocking(
+            static_cast<const ast::Scope&>(netlist.realm));
+        
+        // If not found in netlist.realm, search all instances for default clocking
+        // This handles bind modules where the assertions are in a separate module
+        if (!defaultClocking) {
+            auto& root = netlist.compilation.getRoot();
+            
+            // Helper lambda to recursively search instances
+            std::function<void(const ast::InstanceBodySymbol&)> searchInstances;
+            searchInstances = [&](const ast::InstanceBodySymbol& body) {
+                if (defaultClocking) return;
+                
+                defaultClocking = netlist.compilation.getDefaultClocking(body);
+                if (defaultClocking) return;
+                
+                // Recursively check child instances
+                for (auto& member : body.members()) {
+                    if (member.kind == ast::SymbolKind::Instance) {
+                        auto& inst = member.as<ast::InstanceSymbol>();
+                        searchInstances(inst.body);
+                        if (defaultClocking) return;
+                    }
+                }
+            };
+            
+            for (auto* instance : root.topInstances) {
+                searchInstances(instance->body);
+                if (defaultClocking) break;
+            }
+        }
+        
+        if (defaultClocking) {
             auto& clockingBlock = defaultClocking->as<ast::ClockingBlockSymbol>();
             auto& event = clockingBlock.getEvent();
 
@@ -435,51 +552,52 @@ void SVAConverter::extract_clocking(const ast::AssertionExpr &expr) {
                 clk = eval_expr(signalEvent.expr);
             }
         }
-        
-        // If still no clock (e.g., default clocking not found or in bound module),
-        // try to find a clock input in the module
-        if (clk.empty()) {
-            RTLIL::Wire *clock_wire = nullptr;
-            
-            // Try "clock" first (most common)
-            clock_wire = netlist.canvas->wire(ID(clock));
-            
-            // Try "clk" as fallback
-            if (!clock_wire) {
-                clock_wire = netlist.canvas->wire(ID(clk));
-            }
-            
-            // Use the found clock wire if it exists
-            if (clock_wire) {
-                clk = clock_wire;
-            } else {
-                log_warning("SVA: No clock found - assertion will not have proper clocking!\n");
-            }
-        }
     }
 
-    // If no explicit disable iff, check for default disable iff
+    // If no explicit disable iff, try default disable from slang
     if (!explicit_disable_iff) {
-        if (auto defaultDisable = netlist.compilation.getDefaultDisable(static_cast<const ast::Scope&>(netlist.realm))) {
-            //  Try to find the reset signal in the module (similar to clock handling)
-            RTLIL::Wire *reset_wire = netlist.canvas->wire(ID(reset));
-            if (reset_wire) {
-                rst = reset_wire;
-                has_reset = true;
-            } else {
-                // Fallback to evaluating the expression
-                rst = eval_expr(*defaultDisable);
-                has_reset = true;
-            }
-        } else {
-            // If slang doesn't provide default disable iff (e.g., due to bind),
-            // try common reset input names as fallback
-            RTLIL::Wire *reset_wire = netlist.canvas->wire(ID(reset));
-            if (reset_wire && reset_wire->port_input) {
-                rst = reset_wire;
-                has_reset = true;
+        // Similar to clocking, search for default disable in all definitions
+        auto defaultDisable = netlist.compilation.getDefaultDisable(
+            static_cast<const ast::Scope&>(netlist.realm));
+        
+        // If not found in netlist.realm, search all instances for default disable
+        if (!defaultDisable) {
+            auto& root = netlist.compilation.getRoot();
+            
+            // Helper lambda to recursively search instances
+            std::function<void(const ast::InstanceBodySymbol&)> searchInstances;
+            searchInstances = [&](const ast::InstanceBodySymbol& body) {
+                if (defaultDisable) return;
+                
+                defaultDisable = netlist.compilation.getDefaultDisable(body);
+                if (defaultDisable) return;
+                
+                // Recursively check child instances
+                for (auto& member : body.members()) {
+                    if (member.kind == ast::SymbolKind::Instance) {
+                        auto& inst = member.as<ast::InstanceSymbol>();
+                        searchInstances(inst.body);
+                        if (defaultDisable) return;
+                    }
+                }
+            };
+            
+            for (auto* instance : root.topInstances) {
+                searchInstances(instance->body);
+                if (defaultDisable) break;
             }
         }
+        
+        if (defaultDisable) {
+            rst = eval_expr(*defaultDisable);
+            has_reset = true;
+        }
+    }
+    
+    // IEEE 1800-2017: Concurrent assertions require a clocking event
+    if (clk.empty()) {
+        log_error("SVA: Concurrent assertion requires clocking event. "
+                 "Provide either explicit @(posedge clk) or default clocking block.\n");
     }
 }
 
@@ -1993,3 +2111,5 @@ void SVAConverter::getFirstAcceptReject(RTLIL::SigBit *accept_p, RTLIL::SigBit *
 }
 
 } // namespace slang_frontend
+
+

@@ -1864,20 +1864,25 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 						         std::string(name).c_str());
 					}
 
-					require(expr, call.arguments().size() >= 1);
-					auto sig = (*this)(*call.arguments()[0]);
-					auto past_sig = netlist.canvas->addWire(NEW_ID, sig.size());
+				require(expr, call.arguments().size() >= 1);
+				auto sig = (*this)(*call.arguments()[0]);
+				auto past_sig = netlist.canvas->addWire(NEW_ID, sig.size());
 
-					// Get clock wire
+				RTLIL::SigSpec clk_spec = sva_clock;
+				if (clk_spec.empty()) {
 					auto clk_wire = netlist.canvas->wire(ID(\\clk));
 					if (!clk_wire) {
 						clk_wire = netlist.canvas->wire(ID(clock));
 					}
-					if (!clk_wire) {
-						log_error("Cannot evaluate %s without a clock signal.\n", std::string(name).c_str());
+					if (clk_wire) {
+						clk_spec = clk_wire;
 					}
+				}
+				if (clk_spec.empty()) {
+					log_error("Cannot evaluate %s without a clock signal.\n", std::string(name).c_str());
+				}
 
-					netlist.canvas->addDff(NEW_ID, clk_wire, sig, past_sig);
+				netlist.canvas->addDff(NEW_ID, clk_spec, sig, past_sig);
 
 					if (name == "$rose") {
 						ret = netlist.LogicAnd(sig, netlist.LogicNot(past_sig));
@@ -1889,42 +1894,48 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 						ret = netlist.LogicNot(netlist.Eq(sig, past_sig));
 					}
 				} else if (name == "$past") {
-					// $past can have 1, 2, or 3 arguments: expr, [depth], [enable]
-					// In SVA context, this should be handled by SVA converter
-					if (in_sva_context) {
-						log_error("SVA system function $past encountered in expression evaluation while in SVA context.\n"
-						         "This should be handled by the SVA converter, not the general expression evaluator.\n"
-						         "This is likely a bug in the SVA converter's eval_expr method.\n");
-					}
+				// $past can have 1, 2, or 3 arguments: expr, [depth], [enable]
+				// In SVA context, this should be handled by SVA converter
+				if (in_sva_context) {
+					log_error("SVA system function $past encountered in expression evaluation while in SVA context.\n"
+					         "This should be handled by the SVA converter, not the general expression evaluator.\n"
+					         "This is likely a bug in the SVA converter's eval_expr method.\n");
+				}
 
-					require(expr, call.arguments().size() >= 1 && call.arguments().size() <= 3);
-					auto sig = (*this)(*call.arguments()[0]);
-					int depth = 1;
-					if (call.arguments().size() >= 2) {
-						// Evaluate the depth argument as a constant
-						auto cv = call.arguments()[1]->eval(const_);
-						if (cv && cv.isInteger()) {
-							depth = (int)cv.integer().as<int>().value();
-						}
+				require(expr, call.arguments().size() >= 1 && call.arguments().size() <= 3);
+				auto sig = (*this)(*call.arguments()[0]);
+				int depth = 1;
+				if (call.arguments().size() >= 2) {
+					// Evaluate the depth argument as a constant
+					auto cv = call.arguments()[1]->eval(const_);
+					if (cv && cv.isInteger()) {
+						depth = (int)cv.integer().as<int>().value();
 					}
+				}
 
-					// Get clock wire
+				// Get clock wire
+				RTLIL::SigSpec clk_spec = sva_clock;
+				if (clk_spec.empty()) {
 					auto clk_wire = netlist.canvas->wire(ID(\\clk));
 					if (!clk_wire) {
 						clk_wire = netlist.canvas->wire(ID(clock));
 					}
-					if (!clk_wire) {
-						log_error("Cannot evaluate $past without a clock signal.\n");
+					if (clk_wire) {
+						clk_spec = clk_wire;
 					}
+				}
+				if (clk_spec.empty()) {
+					log_error("Cannot evaluate $past without a clock signal.\n");
+				}
 
-					// Create shift register for depth
-					RTLIL::SigSpec current = sig;
-					for (int i = 0; i < depth; i++) {
-						auto next = netlist.canvas->addWire(NEW_ID, sig.size());
-						netlist.canvas->addDff(NEW_ID, clk_wire, current, next);
-						current = next;
-					}
-					ret = current;
+				// Create shift register for depth
+				RTLIL::SigSpec current = sig;
+				for (int i = 0; i < depth; i++) {
+					auto next = netlist.canvas->addWire(NEW_ID, sig.size());
+					netlist.canvas->addDff(NEW_ID, clk_spec, current, next);
+					current = next;
+				}
+				ret = current;
 				} else if (name == "$onehot" || name == "$onehot0") {
 					require(expr, call.arguments().size() == 1);
 					auto sig = (*this)(*call.arguments()[0]);
