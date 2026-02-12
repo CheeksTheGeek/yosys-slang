@@ -1,0 +1,56 @@
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [7:0] data);
+	logic [7:0] past1, past2, past3;
+	logic rose, fell, stable, changed;
+	always_ff @(posedge clk) begin
+		past1 <= $past(data);
+		past2 <= $past(data);
+		past3 <= $past(data);
+		rose <= $rose(data);
+		fell <= $fell(data);
+		stable <= $stable(data);
+		changed <= $changed(data);
+	end
+endmodule
+EOF
+select -assert-count 1 t:$dffe
+select -assert-count 2 t:$logic_and
+select -assert-count 2 t:$eq
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [7:0] data);
+	logic [7:0] result1, result2;
+	always_ff @(posedge clk) begin
+		result1 <= $past(data);
+	end
+	always_ff @(posedge clk) begin
+		result2 <= $past(data);
+	end
+endmodule
+EOF
+select -assert-count 1 t:$dffe
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [7:0] a, b);
+	logic [8:0] result;
+	always_ff @(posedge clk) begin
+		result <= $past(a) + $past(b) + $past(a + b);
+	end
+endmodule
+EOF
+select -assert-count 3 t:$dffe
+select -assert-count 3 t:$add
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [7:0] data);
+	logic [7:0] result;
+	always_ff @(posedge clk) begin
+		result <= $past($past(data));
+	end
+endmodule
+EOF
+select -assert-count 2 t:$dffe

@@ -57,6 +57,9 @@ set(ALL_TESTS
     various/wait_test.ys
     various/expect_test.ys
     various/program_test.ys
+    various/sampled_value_functions.ys
+    various/sampled_value_advanced.ys
+    various/sampled_value_edge_cases.ys
 )
 
 foreach(test_script ${ALL_TESTS})

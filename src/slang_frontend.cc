@@ -1266,6 +1266,303 @@ VariableBits EvalContext::lhs(const ast::Expression &expr)
 	return ret;
 }
 
+// Helper to get or create a $past shift register chain with caching for hardware sharing
+// This implements IEEE 1800-2023 section 16.9.3 $past function
+RTLIL::SigSpec EvalContext::get_or_create_past_signal(
+	const ast::Expression &expr,
+	int depth,
+	const ast::Expression *gate_expr,
+	RTLIL::SigSpec clk_sig,
+	bool clk_pol,
+	const ast::Expression *gval_expr)
+{
+	// Validate depth parameter
+	// MAX_PAST_DEPTH=256: Reasonable limit for hardware synthesis
+	// - Typical FPGAs have ~1M+ flip-flops, 256 DFFs is <0.03% for single signal
+	// - Prevents accidental typos like $past(x, 10000) consuming excessive resources
+	// - Deep delays (>256) usually indicate design smell (consider FIFOs instead)
+	constexpr int MAX_PAST_DEPTH = 256;
+	if (depth < 1 || depth > MAX_PAST_DEPTH) {
+		auto &diag = netlist.add_diag(diag::LangFeatureUnsupported, expr.sourceRange);
+		diag << std::string_view("$past depth ")
+		     << std::to_string(depth)
+		     << std::string_view(" outside range [1,")
+		     << std::to_string(MAX_PAST_DEPTH)
+		     << std::string_view("]");
+		return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+	}
+
+	// Evaluate the input signal first (needed for content-based cache key)
+	RTLIL::SigSpec input_sig = (*this)(expr);
+	int width = input_sig.size();
+	if (width == 0)
+		return input_sig;
+
+	// Evaluate gating signal if provided
+	RTLIL::SigSpec gate_sig = RTLIL::S1; // Default: always enabled
+	if (gate_expr) {
+		gate_sig = (*this)(*gate_expr);
+		// Reduce to 1-bit enable signal (handles multi-bit and zero-width cases)
+		if (gate_sig.size() == 0) {
+			// Zero-width gate signal - treat as always enabled
+			gate_sig = RTLIL::S1;
+		} else if (gate_sig.size() != 1) {
+			gate_sig = netlist.ReduceBool(gate_sig);
+		}
+	}
+
+	// Evaluate gval (initialization value) if provided
+	RTLIL::SigSpec gval_sig = RTLIL::Const(RTLIL::State::S0, width); // Default: initialize to 0
+	if (gval_expr) {
+		gval_sig = (*this)(*gval_expr);
+		// Ensure gval matches signal width
+		if (gval_sig.size() != width) {
+			// Pad or truncate to match width
+			if (gval_sig.size() < width) {
+				// Pad with zeros
+				gval_sig.append(RTLIL::Const(RTLIL::State::S0, width - gval_sig.size()));
+			} else {
+				// Truncate
+				gval_sig = gval_sig.extract(0, width);
+			}
+		}
+	}
+
+	// Check cache using evaluated signals for content-based sharing
+	// This enables sharing when $past(data) appears multiple times, even if
+	// they're different Expression AST nodes
+	NetlistContext::PastCacheKey cache_key{input_sig, depth, gate_sig, clk_sig, clk_pol, gval_sig};
+	auto cached = netlist.past_cache.find(cache_key);
+	if (cached != netlist.past_cache.end()) {
+		// Cache hit - reuse existing shift register chain
+		return cached->second;
+	}
+
+	// Generate truly deterministic name using wire names (not pointers)
+	// Format: \$past$<depth>$<input_name>$d<stage>
+	// Example: \$past$3$data[7:0]$d0, \$past$3$data[7:0]$d1, \$past$3$data[7:0]$d2
+	std::string input_name;
+	{
+		// Build deterministic name from signal structure
+		std::stringstream ss;
+		bool first = true;
+		for (auto chunk : input_sig.chunks()) {
+			if (!first) ss << "_";
+			first = false;
+
+			if (chunk.wire) {
+				// Use wire NAME not pointer - truly deterministic across runs
+				std::string wire_name = RTLIL::unescape_id(chunk.wire->name);
+				ss << wire_name;
+				if (chunk.offset != 0 || chunk.width != chunk.wire->width)
+					ss << "[" << (chunk.offset + chunk.width - 1) << ":" << chunk.offset << "]";
+			} else {
+				// Constant chunk - use value
+				ss << "const" << RTLIL::Const(chunk.data).as_string();
+			}
+		}
+		input_name = ss.str();
+
+		// Sanitize to valid characters for escaped Verilog identifier
+		// Escaped IDs can contain any printable ASCII except whitespace
+		// Replace only truly invalid characters with underscores
+		for (char &c : input_name) {
+			if (!std::isprint(static_cast<unsigned char>(c)) || std::isspace(static_cast<unsigned char>(c)))
+				c = '_';
+		}
+
+		// Limit length to prevent excessive wire names
+		if (input_name.length() > 64) {
+			// For long names, use prefix + deterministic FNV-1a hash
+			// FNV-1a is simple, fast, and deterministic across all platforms/compilers
+			uint32_t hash = 2166136261u; // FNV-1a offset basis
+			for (char c : input_name) {
+				hash ^= static_cast<uint8_t>(c);
+				hash *= 16777619u; // FNV-1a prime
+			}
+			input_name = input_name.substr(0, 48) + "_h" + std::to_string(hash);
+		}
+	}
+
+	std::string base_name = "\\$past$" + std::to_string(depth) + "$" + input_name;
+
+	// Build shift register chain
+	RTLIL::SigSpec current = input_sig;
+	for (int i = 0; i < depth; i++) {
+		std::string wire_name = base_name + "$d" + std::to_string(i);
+		RTLIL::Wire *past_wire = netlist.canvas->addWire(netlist.new_id(wire_name), width);
+
+		// Set init attribute from gval parameter (IEEE 1800-2023 16.9.3 $past semantics)
+		// gval_sig was evaluated earlier and defaults to 0 if not provided
+		past_wire->attributes[RTLIL::ID::init] = gval_sig.as_const();
+
+		// Create DFF with enable (use $dffe to support gating)
+		netlist.canvas->addDffe(
+			netlist.new_id(),
+			clk_sig,
+			gate_sig,
+			current,
+			past_wire,
+			clk_pol,
+			true  // EN_POLARITY - gate is active high (IEEE 1800-2023 16.9.3.1: gating_term enables update)
+		);
+
+		current = past_wire;
+	}
+
+	// Store in cache before returning to enable sharing
+	netlist.past_cache[cache_key] = current;
+
+	return current;
+}
+
+
+// Evaluate sampled value system functions
+// Implements IEEE 1800-2023 section 16.9.3
+RTLIL::SigSpec EvalContext::eval_sampled_value_function(const ast::CallExpression &call)
+{
+	auto name = call.getSubroutineName();
+	const auto args = call.arguments();
+
+	// All functions require at least one argument (the expression to sample)
+	require(call, !args.empty());
+	const ast::Expression &expr = *args[0];
+
+	// Defensive: verify expr has valid type (should never be null in valid AST)
+	if (!expr.type) {
+		log_error("Internal error: expression has null type in %s\n", name.data());
+		return RTLIL::SigSpec(RTLIL::Sx, 1); // Return 1-bit X
+	}
+
+	// Find clock signal - can be from explicit clocking_event OR inferred from procedural context
+	RTLIL::SigSpec clk_sig;
+	bool clk_pol = true;
+	bool clock_from_procedural = false;
+
+	// First check if we're in procedural context (always_ff block)
+	if (!procedural) {
+		auto &diag = netlist.add_diag(diag::LangFeatureUnsupported, call.sourceRange);
+		diag << std::string_view(name) << std::string_view(" used outside always_ff block");
+		return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+	}
+
+	// Validate single clock trigger from procedural context
+	if (procedural->timing.triggers.size() != 1) {
+		auto &diag = netlist.add_diag(diag::LangFeatureUnsupported, call.sourceRange);
+		diag << std::string_view(name)
+		     << std::string_view(" requires single clock edge, found ")
+		     << std::to_string(procedural->timing.triggers.size())
+		     << std::string_view(" triggers");
+		return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+	}
+
+	// Extract default clock from procedural context
+	const auto &trigger = procedural->timing.triggers[0];
+	clk_sig = trigger.signal;
+	clk_pol = trigger.edge_polarity;
+	clock_from_procedural = true;
+
+	// Handle $sampled - returns current value (mainly for assertion contexts)
+	// In procedural contexts this is a no-op as values are already sampled
+	if (name == "$sampled") {
+		return (*this)(expr);
+	}
+
+	// Handle $past with full parameter support
+	// IEEE 1800 syntax: $past(expression, num_ticks, expression2, clocking_event, gval)
+	if (name == "$past") {
+		constexpr int DEFAULT_PAST_DEPTH = 1;
+		int depth = DEFAULT_PAST_DEPTH;
+		const ast::Expression *gate_expr = nullptr;
+		const ast::Expression *gval_expr = nullptr;
+
+		// Parse optional num_ticks argument (MUST be constant integer >= 1 per IEEE 1800-2023)
+		if (args.size() > 1 && args[1]) {
+			auto depth_val = args[1]->eval(const_);
+			if (!depth_val.isInteger()) {
+				auto &diag = netlist.add_diag(diag::LangFeatureUnsupported, args[1]->sourceRange);
+				diag << std::string_view("$past depth must be constant integer");
+				return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+			}
+			if (depth_val.integer().hasUnknown()) {
+				auto &diag = netlist.add_diag(diag::LangFeatureUnsupported, args[1]->sourceRange);
+				diag << std::string_view("$past depth cannot be X/Z");
+				return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+			}
+
+			// Convert to int with overflow check
+			auto depth_int = depth_val.integer().as<int64_t>();
+			if (!depth_int.has_value() || depth_int.value() < 1 || depth_int.value() > INT_MAX) {
+				auto &diag = netlist.add_diag(diag::LangFeatureUnsupported, args[1]->sourceRange);
+				diag << std::string_view("$past depth out of valid range");
+				return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+			}
+
+			depth = (int)depth_int.value();
+			// Range validation (1-256) happens in get_or_create_past_signal
+		}
+
+		// Parse optional gating expression (enables shift register conditionally)
+		// args[2] = expression2 (gating term)
+		if (args.size() > 2 && args[2])
+			gate_expr = args[2];
+
+		// NOTE: args[3] (clocking_event) is not supported by slang in procedural contexts
+		// Slang returns "unsupported language feature" error for @(posedge clk) syntax
+		// Always use clock from procedural context (always_ff block)
+
+		// Parse optional gval (initialization value) - args[4]
+		if (args.size() > 4 && args[4])
+			gval_expr = args[4];
+
+		return get_or_create_past_signal(expr, depth, gate_expr, clk_sig, clk_pol, gval_expr);
+	}
+
+	// For $rose, $fell, $stable, $changed - all defined in terms of $past
+	// NOTE: IEEE 1800 allows optional clocking_event as args[1], but slang doesn't
+	// support it in procedural contexts (returns "unsupported language feature" error)
+	// Always use clock from procedural context (always_ff block)
+
+	// Get $past(expr, 1) - this will use cache to share hardware when possible
+	RTLIL::SigSpec past_val = get_or_create_past_signal(expr, 1, nullptr, clk_sig, clk_pol, nullptr);
+	RTLIL::SigSpec current_val = (*this)(expr);
+
+	if (name == "$rose") {
+		// $rose(expr): Detects 0-to-nonzero transition
+		// True when: reduction-OR(past_val) == 0 AND reduction-OR(current_val) == 1
+		// For multi-bit: any bit transitioning from all-zeros to any-ones
+		RTLIL::SigSpec past_is_zero = netlist.LogicNot(netlist.ReduceBool(past_val));
+		RTLIL::SigSpec current_is_nonzero = netlist.ReduceBool(current_val);
+		return netlist.LogicAnd(past_is_zero, current_is_nonzero);
+	}
+
+	if (name == "$fell") {
+		// $fell(expr): Detects nonzero-to-0 transition
+		// True when: reduction-OR(past_val) == 1 AND reduction-OR(current_val) == 0
+		// For multi-bit: any bit transitioning from any-ones to all-zeros
+		RTLIL::SigSpec past_is_nonzero = netlist.ReduceBool(past_val);
+		RTLIL::SigSpec current_is_zero = netlist.LogicNot(netlist.ReduceBool(current_val));
+		return netlist.LogicAnd(past_is_nonzero, current_is_zero);
+	}
+
+	if (name == "$stable") {
+		// $stable(expr): True when value hasn't changed
+		// Equivalent to: expr == $past(expr)
+		return netlist.ReduceBool(netlist.Eq(current_val, past_val));
+	}
+
+	if (name == "$changed") {
+		// $changed(expr): True when value has changed
+		// Equivalent to: expr != $past(expr)
+		RTLIL::SigSpec eq = netlist.Eq(current_val, past_val);
+		return netlist.LogicNot(netlist.ReduceBool(eq));
+	}
+
+	// Should never reach here given the dispatcher checks function names
+	log_error("Internal error: unknown sampled value function '%s'\n", name.data());
+	return RTLIL::SigSpec(RTLIL::Sx, (int)expr.type->getBitstreamWidth());
+}
+
 RTLIL::SigSpec EvalContext::connection_lhs(ast::AssignmentExpression const &assign)
 {
 	ast_invariant(assign, !assign.timingControl);
@@ -1776,9 +2073,18 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				require(expr, procedural != nullptr);
 				StatementVisitor(*procedural).handle_display(call);
 			} else if (call.isSystemCall()) {
-				require(expr, call.getSubroutineName() == "$signed" || call.getSubroutineName() == "$unsigned");
-				require(expr, call.arguments().size() == 1);
-				ret = (*this)(*call.arguments()[0]);
+				auto name = call.getSubroutineName();
+
+				// Handle sampled value system functions (IEEE 1800-2023 section 16.9.3)
+				if (name == "$past" || name == "$rose" || name == "$fell" ||
+				    name == "$stable" || name == "$changed" || name == "$sampled") {
+					ret = eval_sampled_value_function(call);
+				} else if (name == "$signed" || name == "$unsigned") {
+					require(expr, call.arguments().size() == 1);
+					ret = (*this)(*call.arguments()[0]);
+				} else {
+					require(expr, false); // Unknown system call
+				}
 			} else {
 				const auto &subr = *std::get<0>(call.subroutine);
 				if (procedural) {
@@ -3287,6 +3593,9 @@ NetlistContext::NetlistContext(
 {
 	canvas = design->addModule(module_type_id(instance.body));
 	transfer_attrs(instance.body.getDefinition(), canvas);
+
+	// Ensure cache starts empty for this module (defense against shared state bugs)
+	past_cache.clear();
 }
 
 NetlistContext::NetlistContext(

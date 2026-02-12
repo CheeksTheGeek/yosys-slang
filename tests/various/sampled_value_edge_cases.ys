@@ -1,0 +1,75 @@
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [3:0] data);
+	logic [3:0] result;
+	always_ff @(posedge clk) begin
+		result <= $past(data, 256);
+	end
+endmodule
+EOF
+select -assert-count 256 t:$dffe
+
+design -reset
+read_slang <<EOF
+module top(input logic clk1, input logic clk2, input logic [7:0] data);
+	logic [7:0] result1, result2;
+	always_ff @(posedge clk1) begin
+		result1 <= $past(data);
+	end
+	always_ff @(posedge clk2) begin
+		result2 <= $past(data);
+	end
+endmodule
+EOF
+select -assert-count 2 t:$dffe
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [7:0] data);
+	logic [7:0] pos_result, neg_result;
+	always_ff @(posedge clk) begin
+		pos_result <= $past(data);
+	end
+	always_ff @(negedge clk) begin
+		neg_result <= $past(data);
+	end
+endmodule
+EOF
+select -assert-count 2 t:$dffe
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [7:0] data, input logic sig);
+	logic [7:0] past_data;
+	logic rose, fell;
+	always_ff @(posedge clk) begin
+		past_data <= $past(data);
+		rose <= $rose(sig);
+		fell <= $fell(sig);
+	end
+endmodule
+EOF
+select -assert-count 2 t:$dffe
+select -assert-count 2 t:$logic_and
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic gate_xz, input logic [7:0] data);
+	logic [7:0] result;
+	always_ff @(posedge clk) begin
+		result <= $past(data, 1, gate_xz);
+	end
+endmodule
+EOF
+select -assert-count 1 t:$dffe
+
+design -reset
+read_slang <<EOF
+module top(input logic clk, input logic [1023:0] mega_wide);
+	logic [1023:0] result;
+	always_ff @(posedge clk) begin
+		result <= $past(mega_wide);
+	end
+endmodule
+EOF
+select -assert-count 1 t:$dffe

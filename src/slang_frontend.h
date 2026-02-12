@@ -37,6 +37,7 @@ namespace slang {
 		class StreamingConcatenationExpression;
 		class ConversionExpression;
 		class AssignmentExpression;
+		class CallExpression;
 	};
 };
 
@@ -150,6 +151,17 @@ struct EvalContext {
 	// an assignment as a stand-in for a value implied by the context
 	// (instance output connection or inside pattern assignments)
 	RTLIL::SigSpec connection_lhs(ast::AssignmentExpression const &assign);
+
+	// Sampled value system functions (IEEE 1800-2023 section 16.9.3)
+	// Implements: $past, $rose, $fell, $stable, $changed, $sampled
+	RTLIL::SigSpec eval_sampled_value_function(const ast::CallExpression &call);
+	RTLIL::SigSpec get_or_create_past_signal(
+		const ast::Expression &expr,
+		int depth,
+		const ast::Expression *gate_expr,
+		RTLIL::SigSpec clk_sig,
+		bool clk_pol,
+		const ast::Expression *gval_expr);
 
 	EvalContext(NetlistContext &netlist);
 	EvalContext(NetlistContext &netlist, ProceduralContext &procedural);
@@ -468,6 +480,46 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 
 	// Cache per-symbol Wire* pointers
 	Yosys::dict<const ast::Symbol*, RTLIL::Wire *> wire_cache;
+
+	// Key for caching $past shift register chains (IEEE 1800-2023 16.9.3)
+	// Uses the evaluated signal (SigSpec) rather than expression pointer for content-based sharing
+	struct PastCacheKey {
+		RTLIL::SigSpec input_sig;  // The evaluated signal being delayed
+		int depth;
+		RTLIL::SigSpec gate_sig;   // The gate enable signal (S1 if ungated)
+		RTLIL::SigSpec clk_sig;
+		bool clk_pol;
+		RTLIL::SigSpec gval_sig;   // The initialization value (S0 if not specified)
+
+		bool operator==(const PastCacheKey &other) const {
+			return input_sig == other.input_sig &&
+			       depth == other.depth &&
+			       gate_sig == other.gate_sig &&
+			       clk_sig == other.clk_sig &&
+			       clk_pol == other.clk_pol &&
+			       gval_sig == other.gval_sig;
+		}
+
+		// Use tuple-based hashing consistent with Variable class
+		typedef std::tuple<RTLIL::SigSpec, int, RTLIL::SigSpec, RTLIL::SigSpec, bool, RTLIL::SigSpec> HashTuple;
+		HashTuple hash_tuple() const {
+			return std::make_tuple(input_sig, depth, gate_sig, clk_sig, clk_pol, gval_sig);
+		}
+
+#if YS_HASHING_VERSION >= 1
+		[[nodiscard]] Yosys::Hasher hash_into(Yosys::Hasher h) const {
+			h.eat(hash_tuple());
+			return h;
+		}
+#else
+		unsigned int hash() const {
+			return Yosys::hash_ops<HashTuple>::hash(hash_tuple());
+		}
+#endif
+	};
+
+	// Cache for $past shift register chains to enable hardware sharing across procedural blocks
+	Yosys::dict<PastCacheKey, RTLIL::SigSpec> past_cache;
 
 	// With this flag set we will not elaborate this netlist; we set this when
 	// `scopes_remap` is incomplete due to errors in processing an instantiation
