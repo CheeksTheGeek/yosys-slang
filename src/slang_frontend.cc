@@ -1708,6 +1708,21 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 			if (type.in(ID($shr), ID($shl), ID($sshr), ID($sshl)))
 				b_signed = false;
 
+			// For arithmetic shifts, context-propagated conversions from ==
+			// may have changed the left operand's type to unsigned. Look
+			// through Propagated ConversionExpressions to find the original
+			// signedness so that $signed(x) >>> y works correctly.
+			if (type.in(ID($sshr), ID($sshl))) {
+				const ast::Expression *lop = &biop.left();
+				while (lop->kind == ast::ExpressionKind::Conversion) {
+					auto &conv = lop->as<ast::ConversionExpression>();
+					if (conv.conversionKind != ast::ConversionKind::Propagated)
+						break;
+					lop = &conv.operand();
+				}
+				a_signed = lop->type->isSigned();
+			}
+
 			ret = netlist.Biop(
 				type, left, right,
 				a_signed, b_signed, expr.type->getBitstreamWidth()

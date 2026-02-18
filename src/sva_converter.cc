@@ -19,6 +19,7 @@
 #include "slang/ast/expressions/CallExpression.h"
 #include "slang/ast/expressions/SelectExpressions.h"
 #include "slang/ast/expressions/ConversionExpression.h"
+#include "slang/text/SourceManager.h"
 #include <functional>
 
 using Yosys::GetSize;
@@ -179,18 +180,18 @@ RTLIL::SigSpec SVAConverter::eval_expr(const ast::Expression &expr) {
                 case BinaryOperator::CaseEquality:   return netlist.canvas->Eqx(NEW_ID, left, right);
                 case BinaryOperator::CaseInequality: return netlist.canvas->Nex(NEW_ID, left, right);
 
-                case BinaryOperator::LessThan:          return netlist.canvas->Lt(NEW_ID, left, right, bin.type->isSigned());
-                case BinaryOperator::LessThanEqual:     return netlist.canvas->Le(NEW_ID, left, right, bin.type->isSigned());
-                case BinaryOperator::GreaterThan:       return netlist.canvas->Gt(NEW_ID, left, right, bin.type->isSigned());
-                case BinaryOperator::GreaterThanEqual:  return netlist.canvas->Ge(NEW_ID, left, right, bin.type->isSigned());
+                case BinaryOperator::LessThan:          return netlist.canvas->Lt(NEW_ID, left, right, bin.left().type->isSigned());
+                case BinaryOperator::LessThanEqual:     return netlist.canvas->Le(NEW_ID, left, right, bin.left().type->isSigned());
+                case BinaryOperator::GreaterThan:       return netlist.canvas->Gt(NEW_ID, left, right, bin.left().type->isSigned());
+                case BinaryOperator::GreaterThanEqual:  return netlist.canvas->Ge(NEW_ID, left, right, bin.left().type->isSigned());
 
                 case BinaryOperator::LogicalAnd: return netlist.canvas->LogicAnd(NEW_ID, left, right);
                 case BinaryOperator::LogicalOr:  return netlist.canvas->LogicOr(NEW_ID, left, right);
 
                 case BinaryOperator::LogicalShiftLeft:  return netlist.canvas->Shl(NEW_ID, left, right, false);
                 case BinaryOperator::LogicalShiftRight: return netlist.canvas->Shr(NEW_ID, left, right);
-                case BinaryOperator::ArithmeticShiftLeft:  return netlist.canvas->Shl(NEW_ID, left, right, bin.type->isSigned());
-                case BinaryOperator::ArithmeticShiftRight: return netlist.canvas->Sshr(NEW_ID, left, right);
+                case BinaryOperator::ArithmeticShiftLeft:  return netlist.canvas->Shl(NEW_ID, left, right, bin.left().type->isSigned());
+                case BinaryOperator::ArithmeticShiftRight: return netlist.canvas->Sshr(NEW_ID, left, right, bin.left().type->isSigned());
 
                 case BinaryOperator::LogicalImplication:
                     // a -> b is equivalent to !a || b
@@ -365,8 +366,34 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
     reset_fsm();
 
     using AK = ast::AssertionExprKind;
-    if (stmt.propertySpec.kind == AK::Binary) {
-        auto &bin = stmt.propertySpec.as<ast::BinaryAssertionExpr>();
+
+    // Unwrap the property spec to find the innermost expression, looking through:
+    // - Simple(AssertionInstance(...)) — named property references
+    // - Clocking(...) — explicit @(posedge clk) wrappers
+    // - DisableIff(...) — disable iff wrappers (already extracted)
+    const ast::AssertionExpr *inner = &stmt.propertySpec;
+    for (;;) {
+        if (inner->kind == AK::Simple) {
+            auto &simple = inner->as<ast::SimpleAssertionExpr>();
+            if (simple.expr.kind == ast::ExpressionKind::AssertionInstance) {
+                auto &aie = simple.expr.as<ast::AssertionInstanceExpression>();
+                inner = &aie.body;
+                continue;
+            }
+        }
+        if (inner->kind == AK::Clocking) {
+            inner = &inner->as<ast::ClockingAssertionExpr>().expr;
+            continue;
+        }
+        if (inner->kind == AK::DisableIff) {
+            inner = &inner->as<ast::DisableIffAssertionExpr>().expr;
+            continue;
+        }
+        break;
+    }
+
+    if (inner->kind == AK::Binary) {
+        auto &bin = inner->as<ast::BinaryAssertionExpr>();
         using Op = ast::BinaryAssertionOperator;
 
         if (bin.op == Op::OverlappedImplication || bin.op == Op::NonOverlappedImplication) {
@@ -390,7 +417,7 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
 
             // Fall through to materialize consequent FSM
         } else {
-            // Not an implication, parse normally 
+            // Not an implication, parse normally
             int node = parse_sequence(stmt.propertySpec, createStartNode());
             createLink(node, acceptNode);
         }
@@ -422,6 +449,10 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
     RTLIL::SigBit sig_en = netlist.canvas->Or(NEW_ID, accept_sig, reject_sig);
 
     RTLIL::SigBit enable_sig = sig_en;
+    if (has_reset && !rst.empty()) {
+        RTLIL::SigBit not_rst = netlist.canvas->Not(NEW_ID, rst);
+        enable_sig = netlist.canvas->And(NEW_ID, sig_en, not_rst);
+    }
 
     // Create $check cell
     std::string flavor;
@@ -455,6 +486,17 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
         default:
             netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange);
             return;
+    }
+
+    if (cell) {
+        auto sr = stmt.sourceRange;
+        auto *sm = netlist.compilation.getSourceManager();
+        if (sm) {
+            std::string fn{sm->getFileName(sr.start())};
+            auto line = sm->getLineNumber(sr.start());
+            log("SVA: %s cell '%s' -> %s:%d\n", flavor.c_str(),
+                cell->name.c_str(), fn.c_str(), (int)line);
+        }
     }
 }
 
@@ -640,8 +682,11 @@ RTLIL::SigSpec SVAConverter::create_dff(RTLIL::SigSpec d, RTLIL::IdString name_h
 
     RTLIL::Wire *q_wire = netlist.canvas->addWire(name_hint, d.size());
     
-    // Choose cell type based on whether we have async reset
-    RTLIL::IdString cell_type = (has_reset && !rst.empty()) ? ID($adff) : ID($dff);
+    // Choose cell type based on whether we have sync reset (disable iff)
+    // Use $sdff (sync reset) instead of $adff (async reset) so that the reset
+    // clears FSM state at the next clock edge. This prevents stale antecedent
+    // matches from propagating when disable iff transitions from true to false.
+    RTLIL::IdString cell_type = (has_reset && !rst.empty()) ? ID($sdff) : ID($dff);
     auto cell = netlist.canvas->addCell(gen_id("dff_cell"), cell_type);
 
     cell->setParam(ID::WIDTH, d.size());
@@ -655,11 +700,11 @@ RTLIL::SigSpec SVAConverter::create_dff(RTLIL::SigSpec d, RTLIL::IdString name_h
     cell->setPort(ID::D, d);
     cell->setPort(ID::Q, q_wire);
 
-    // Add async reset if available
+    // Add sync reset if available (for disable iff)
     if (has_reset && !rst.empty()) {
-        cell->setParam(ID::ARST_POLARITY, 1);
-        cell->setPort(ID::ARST, rst);
-        cell->setParam(ID::ARST_VALUE, RTLIL::Const(0, d.size()));
+        cell->setParam(ID::SRST_POLARITY, 1);
+        cell->setPort(ID::SRST, rst);
+        cell->setParam(ID::SRST_VALUE, RTLIL::Const(0, d.size()));
     }
 
     return q_wire;
