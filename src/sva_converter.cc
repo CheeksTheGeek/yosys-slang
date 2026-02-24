@@ -21,6 +21,7 @@
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/text/SourceManager.h"
 #include <functional>
+#include <set>
 
 using Yosys::GetSize;
 
@@ -371,12 +372,25 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
     // - Simple(AssertionInstance(...)) — named property references
     // - Clocking(...) — explicit @(posedge clk) wrappers
     // - DisableIff(...) — disable iff wrappers (already extracted)
+    bool property_negated = false;
     const ast::AssertionExpr *inner = &stmt.propertySpec;
     for (;;) {
         if (inner->kind == AK::Simple) {
             auto &simple = inner->as<ast::SimpleAssertionExpr>();
             if (simple.expr.kind == ast::ExpressionKind::AssertionInstance) {
                 auto &aie = simple.expr.as<ast::AssertionInstanceExpression>();
+                // Register local variable wires before unwrapping into the body.
+                // The body may contain assignments like (cond, cap = x) which
+                // reference these symbols; they must exist in wire_cache before
+                // parse_sequence() is called on the binary antecedent/consequent.
+                for (auto *local_var : aie.localVars) {
+                    if (!netlist.canvas->wire(netlist.id(*local_var))) {
+                        auto &value_sym = local_var->as<ast::ValueSymbol>();
+                        netlist.add_wire(value_sym);
+                        log_debug("SVA: pre-registered local var wire: %s\n",
+                                  std::string(local_var->name).c_str());
+                    }
+                }
                 inner = &aie.body;
                 continue;
             }
@@ -388,6 +402,15 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
         if (inner->kind == AK::DisableIff) {
             inner = &inner->as<ast::DisableIffAssertionExpr>().expr;
             continue;
+        }
+        // Handle `not` property operator: track negation and unwrap
+        if (inner->kind == AK::Unary) {
+            auto &unary = inner->as<ast::UnaryAssertionExpr>();
+            if (unary.op == ast::UnaryAssertionOperator::Not) {
+                property_negated = !property_negated;
+                inner = &unary.expr;
+                continue;
+            }
         }
         break;
     }
@@ -445,7 +468,13 @@ void SVAConverter::convert(const ast::ConcurrentAssertionStatement &stmt) {
     // Enable and assertion signals
     // NOTE: Not adding final DFF stage - only adds it conditionally based on clocking.body_net
     // For now, use combinational signals directly to match test behavior
-    RTLIL::SigBit sig_a = netlist.canvas->Not(NEW_ID, reject_sig);
+    RTLIL::SigBit sig_a;
+    if (property_negated) {
+        // `not P`: assertion fails when P's FSM accepts (P holds → not P violated)
+        sig_a = netlist.canvas->Not(NEW_ID, accept_sig);
+    } else {
+        sig_a = netlist.canvas->Not(NEW_ID, reject_sig);
+    }
     RTLIL::SigBit sig_en = netlist.canvas->Or(NEW_ID, accept_sig, reject_sig);
 
     RTLIL::SigBit enable_sig = sig_en;
@@ -1433,22 +1462,45 @@ int SVAConverter::parse_simple(const ast::SimpleAssertionExpr &expr, int start_n
                 // LocalAssertionVarSymbol inherits from VariableSymbol which inherits from ValueSymbol
                 auto &value_sym = local_var->as<ast::ValueSymbol>();
                 netlist.add_wire(value_sym);
-                log_debug("SVA: Created wire for local assertion variable: %s\n", 
+                log_debug("SVA: Created wire for local assertion variable: %s\n",
                          std::string(local_var->name).c_str());
             }
         }
-        
-        // Recursively visit the assertion body
+
+        // If there's no repetition on this named sequence reference, just recurse
+        if (!expr.repetition.has_value()) {
+            return parse_sequence(aie.body, start_node);
+        }
+
+        // Named sequence with repetition (e.g., normal_flow[*3]).
+        // For simple-boolean named sequences, extract the condition and fall
+        // through to the standard repetition handling code below.
+        const ast::AssertionExpr &body = aie.body;
+        if (body.kind == ast::AssertionExprKind::Simple) {
+            auto &body_simple = body.as<ast::SimpleAssertionExpr>();
+            if (!body_simple.repetition.has_value()) {
+                // Body is a plain boolean — evaluate it and fall through
+                // to the repetition code which will use cond_bit.
+                goto eval_body_for_repetition;
+            }
+        }
+        // Complex body with repetition — not yet supported, parse without repetition
+        log("Warning: SVA repetition on complex named sequence ignored\n");
         return parse_sequence(aie.body, start_node);
     }
-    
-    // Note: In slang, complex sequences with repetition like (a ##1 b)[*3] 
-    // are typically parsed differently - the sequence concat becomes the top-level
-    // assertion, not nested inside a SimpleAssertionExpr. So we don't need special
-    // handling here for that case.
-    
-    // Evaluate the boolean expression
-    RTLIL::SigSpec condition = eval_expr(expr.expr);
+
+eval_body_for_repetition:
+    // Evaluate the boolean expression.
+    // For named sequences (AssertionInstance) with repetition, we reach here
+    // after extracting the body; evaluate the body's inner expression directly.
+    RTLIL::SigSpec condition;
+    if (expr.expr.kind == EK::AssertionInstance) {
+        auto &aie = expr.expr.as<ast::AssertionInstanceExpression>();
+        auto &body_simple = aie.body.as<ast::SimpleAssertionExpr>();
+        condition = eval_expr(body_simple.expr);
+    } else {
+        condition = eval_expr(expr.expr);
+    }
     RTLIL::SigBit cond_bit = netlist.ReduceBool(condition);
 
     // Handle repetition if present
@@ -1503,8 +1555,14 @@ int SVAConverter::parse_simple(const ast::SimpleAssertionExpr &expr, int start_n
                 for (int i = min_count; i < max_count; i++) {
                     int next_node = createNode();
                     createEdge(node, next_node, cond_bit);
-                    // Allow exiting at any point in the range
+                    // Allow exiting at any point in the range.
+                    // Exit links must bypass `throughout` — the sequence has already
+                    // ended at this count, so the throughout condition should not be
+                    // checked on the exit path (only on active sequence ticks).
+                    RTLIL::SigBit saved_throughout = throughout_sig;
+                    throughout_sig = RTLIL::S1;
                     createLink(node, next_node);
+                    throughout_sig = saved_throughout;
                     prev_node = node;
                     node = next_node;
                 }
